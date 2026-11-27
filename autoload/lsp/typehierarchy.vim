@@ -5,6 +5,7 @@ vim9script
 import './options.vim' as opt
 import './util.vim'
 import './symbol.vim'
+import './origin.vim'
 
 # Parse the type hierarchy in "typeHier" and displays a tree of type names
 # in the current buffer.  This function is called recursively to display the
@@ -132,7 +133,13 @@ def TypeHierPopupCallback(lspserver: dict<any>, typeUriMap: list<dict<any>>,
 
   # Save the current cursor location in the tag stack.
   util.PushCursorToTagStack()
-  util.JumpToLspLocation(typeUriMap[selIdx - 1], '')
+  var location = typeUriMap[selIdx - 1]
+  var savedOrigin = origin.Begin(lspserver, util.LspLocationFiles([location]))
+  try
+    util.JumpToLspLocation(location, '')
+  finally
+    origin.End(savedOrigin)
+  endtry
 enddef
 
 # Show the super or sub type hierarchy items "types" as a tree in a popup

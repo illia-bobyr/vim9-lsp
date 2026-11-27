@@ -91,6 +91,13 @@ export def LspLocationParse(lsploc: dict<any>): list<any>
   endif
 enddef
 
+# Returns the file names of the LSP Location or LocationLink items in
+# "lsplocs"
+export def LspLocationFiles(lsplocs: list<dict<any>>): list<string>
+  return lsplocs->mapnew((_, lsploc) =>
+			  LspUriToFile(LspLocationParse(lsploc)[0]))
+enddef
+
 # convert a normal string to a url encoded string
 def UriEncode(str: string): string
   var parts: list<string> = []

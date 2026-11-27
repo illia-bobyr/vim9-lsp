@@ -5,6 +5,7 @@ vim9script
 source common.vim
 
 import '../autoload/lsp/buffer.vim' as buf
+import '../autoload/lsp/symbol.vim'
 import '../autoload/lsp/util.vim' as util
 
 # The language server "gopls" is used for the files below the current
@@ -114,6 +115,15 @@ def g:Test_ServerPerRoot_Disabled()
   assert_equal(srv1.id, srv2.id)
   # The server runs in the current directory
   AssertServerCwd(srv1, getcwd())
+  # With a single instance, the origin of the files is not recorded in a list
+  # of locations
+  var pos = {line: 0, character: 0}
+  symbol.ShowLocations(srv1, [{uri: util.LspFileToUri('Xroot2/util.go'),
+			       range: {start: pos, end: pos}}], false, 'Test')
+  assert_equal('', getloclist(0, {context: 0}).context)
+  assert_equal('', getqflist({context: 0}).context)
+  :lclose
+  :cclose
 
   StopServersAndWipe()
   DeleteRoots()
@@ -166,6 +176,49 @@ def g:Test_ServerPerRoot_Enabled()
 
   StopServersAndWipe()
   g:LspOptionsSet({serverPerRoot: false})
+  delete('XOn', 'rf')
+enddef
+
+# A buffer whose root is ignored (e.g. a library file) is attached to the
+# server instance whose answer opened it, else to the most recently used
+# instance, or to an instance without a root if none is running.
+def g:Test_ServerPerRoot_IgnoredRoot()
+  CreateRoots('XOn', 'gopls-on')
+  # A library module, e.g. in the Go module cache
+  mkdir('XOn/Xlib', 'p')
+  writefile(['module example.com/lib', '', 'go 1.21'], 'XOn/Xlib/go.mod')
+  for fname in ['lib1.go', 'lib2.go', 'lib3.go', 'lib4.go']
+    writefile(['package lib'], $'XOn/Xlib/{fname}')
+  endfor
+  var savedIgnoredPaths = g:LspOptionsGet().workspaceIgnoredPaths
+  g:LspOptionsSet({serverPerRoot: true, workspaceIgnoredPaths:
+		   savedIgnoredPaths + ['XOn/Xlib'->fnamemodify(':p')]})
+
+  # No server instance is running: an instance without a root
+  var srvlib = EditAndGetServer('XOn/Xlib/lib1.go')
+  assert_equal([], srvlib.workspaceFolders)
+  assert_equal(v:null, srvlib.rpcInitializeRequest.rootUri)
+  StopServersAndWipe()
+
+  var srv1 = EditAndGetServer('XOn/Xroot1/main.go')
+  var srv2 = EditAndGetServer('XOn/Xroot2/main.go')
+  # The server instance started first, used last
+  assert_equal(srv1.id, EditAndGetServer('XOn/Xroot1/util.go').id)
+  assert_equal(srv1.id, EditAndGetServer('XOn/Xlib/lib2.go').id)
+  # The server instance started last, used last
+  assert_equal(srv2.id, EditAndGetServer('XOn/Xroot2/util.go').id)
+  assert_equal(srv2.id, EditAndGetServer('XOn/Xlib/lib3.go').id)
+  # Opened from the answer of the server instance used first
+  :edit XOn/Xroot2/main.go
+  var pos = {line: 0, character: 0}
+  symbol.GotoSymbol(srv1, {uri: util.LspFileToUri('XOn/Xlib/lib4.go'),
+			   range: {start: pos, end: pos}}, false, '')
+  assert_equal('XOn/Xlib/lib4.go'->fnamemodify(':p'), expand('%:p'))
+  assert_equal([srv1.id], ServerIds(['XOn/Xlib/lib4.go']))
+
+  StopServersAndWipe()
+  g:LspOptionsSet({serverPerRoot: false,
+		   workspaceIgnoredPaths: savedIgnoredPaths})
   delete('XOn', 'rf')
 enddef
 

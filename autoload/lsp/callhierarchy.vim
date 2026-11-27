@@ -4,12 +4,20 @@ vim9script
 
 import './util.vim'
 import './buffer.vim' as buf
+import './origin.vim'
 
 # Jump to the location of the symbol under the cursor in the call hierarchy
 # tree window.
 def CallHierarchyItemJump()
   var item: dict<any> = w:LspCallHierItemMap[line('.')].item
-  util.JumpToLspLocation(item, '')
+  # The file opened has the server of the call hierarchy as origin
+  var lspserver = buf.BufLspServerGet(w:LspBufnr, 'callHierarchy')
+  var savedOrigin = origin.Begin(lspserver, util.LspLocationFiles([item]))
+  try
+    util.JumpToLspLocation(item, '')
+  finally
+    origin.End(savedOrigin)
+  endtry
 enddef
 
 # Refresh the call hierarchy tree for the symbol at index "idx".

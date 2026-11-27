@@ -10,6 +10,7 @@ import './options.vim' as opt
 import './util.vim'
 import './outline.vim'
 import './offset.vim'
+import './origin.vim'
 
 # Initialize the highlight group and the text property type used for
 # document symbol search
@@ -105,6 +106,8 @@ def JumpToWorkspaceSymbol(lspserver: dict<any>, cmdmods: string,
   if symTbl->empty()
     return
   endif
+  # The file opened has this server as origin
+  var savedOrigin = origin.Begin(lspserver, [symTbl[result - 1].file])
   try
     # Save the current location in the tag stack
     util.PushCursorToTagStack()
@@ -152,6 +155,8 @@ def JumpToWorkspaceSymbol(lspserver: dict<any>, cmdmods: string,
     :normal! zv
   catch
     # ignore exceptions
+  finally
+    origin.End(savedOrigin)
   endtry
 enddef
 
@@ -352,7 +357,14 @@ def LocPopupCallback(lspserver: dict<any>, locations: list<dict<any>>,
   lspserver.peekSymbolPopup = -1
   if selIdx != -1
     util.PushCursorToTagStack()
-    util.JumpToLspLocation(locations[selIdx - 1], '')
+    var location = locations[selIdx - 1]
+    var savedOrigin = origin.Begin(lspserver,
+				   util.LspLocationFiles([location]))
+    try
+      util.JumpToLspLocation(location, '')
+    finally
+      origin.End(savedOrigin)
+    endtry
   endif
 enddef
 
@@ -442,12 +454,18 @@ export def ShowLocations(lspserver: dict<any>, locations: list<dict<any>>,
 
   var save_winid = win_getid()
 
+  var what: dict<any> = {title: title, items: qflist}
+  if lspserver->get('perRoot', false)
+    # The files opened from the list have this server as origin
+    what.context = origin.ListContext(lspserver,
+      qflist->mapnew((_, item) => item.filename))
+  endif
   if opt.lspOptions.useQuickfixForLocations
-    setqflist([], ' ', {title: title, items: qflist})
+    setqflist([], ' ', what)
     var mods: string = ''
     exe $'{mods} copen'
   else
-    setloclist(0, [], ' ', {title: title, items: qflist})
+    setloclist(0, [], ' ', what)
     var mods: string = ''
     exe $'{mods} lopen'
   endif
@@ -542,13 +560,19 @@ enddef
 # symbol.
 export def GotoSymbol(lspserver: dict<any>, location: dict<any>,
 		      peekSymbol: bool, cmdmods: string)
-  if peekSymbol
-    PeekSymbolLocation(lspserver, location)
-  else
-    # Save the current cursor location in the tag stack.
-    util.PushCursorToTagStack()
-    util.JumpToLspLocation(location, cmdmods)
-  endif
+  # The file opened (or loaded) has this server as origin
+  var savedOrigin = origin.Begin(lspserver, util.LspLocationFiles([location]))
+  try
+    if peekSymbol
+      PeekSymbolLocation(lspserver, location)
+    else
+      # Save the current cursor location in the tag stack.
+      util.PushCursorToTagStack()
+      util.JumpToLspLocation(location, cmdmods)
+    endif
+  finally
+    origin.End(savedOrigin)
+  endtry
 enddef
 
 # Process the LSP server reply message for a 'textDocument/definition' request

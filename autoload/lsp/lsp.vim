@@ -24,6 +24,7 @@ import './hover.vim'
 import './inlayhints.vim'
 import './semantichighlight.vim'
 import './ontypeformat.vim'
+import './origin.vim'
 
 # The language servers registered for each file type.  A registration is a
 # template for its server instances:
@@ -45,6 +46,12 @@ var ftypeServerMap: dict<list<dict<any>>> = {}
 # Number of registrations, used for their ids
 var registrationCount = 0
 
+# Number of times a server instance was used, to order the instances by last
+# use.  An instance is used when a buffer attached to it is entered, and when
+# the current buffer is attached to it; its "lastUsed" is then set to this
+# number (see UseBufServers()).
+var useCount = 0
+
 # The key of the single instance of a registration without an instance per
 # root.  A root is a full path, or an empty string, so it cannot be equal.
 const SHARED_ROOT = '*'
@@ -63,6 +70,14 @@ var bufRoots: dict<dict<string>> = {}
 # the buffer is removed, and by ":LspServer restart" and "start", to ask
 # again.
 var bufRootRequests: dict<dict<bool>> = {}
+
+# The origin of each buffer: maps a buffer number to the server instance whose
+# answer opened it (see origin.Find()).  Set when the root of the buffer is
+# resolved with a known origin, and kept until the buffer is wiped out, so
+# that the buffer keeps its origin when its root is resolved again (e.g.
+# after ":edit" or ":LspServer start").  Used for a buffer whose project is
+# not known (see OriginRoot() and ServerRoots()).
+var bufOrigins: dict<dict<any>> = {}
 
 # The settings of a registration that a "configForRoot" function cannot
 # override: they are used before a server instance exists.
@@ -105,6 +120,8 @@ def RegisterEvents()
     autocmd!
     autocmd BufNewFile,BufReadPost * AddFile(expand('<abuf>')->str2nr())
     autocmd FileType * FileTypeSet(expand('<abuf>')->str2nr())
+    # Also triggered when entering a window with another buffer
+    autocmd BufEnter * UseBufServers(expand('<abuf>')->str2nr())
     # Note that when BufWipeOut is invoked, the current buffer may be different
     # from the buffer getting wiped out.
     autocmd BufWipeOut * BufferWipedOut(expand('<abuf>')->str2nr())
@@ -434,12 +451,40 @@ def StartServerByUser()
     return
   endif
 
-  for lspserver in BufInstances(bufnr(), ftype)
+  var bnr = bufnr()
+  var lspservers = BufInstances(bnr, ftype)
+  for lspserver in lspservers
     lspserver.stoppedByUser = false
   endfor
 
-  # Add all the buffers with the current file type to the servers
   ForgetRootRequests(ftype)
+  # The buffers whose root is the root of these instances (e.g. the library
+  # files detached by ":LspServer stop") are attached to them again, the
+  # current buffer first, as it starts a server without a root per instance
+  # (see InitServer()).  Their root is not resolved again: for a file whose
+  # project is not known, it could be the root of another running instance.
+  for reg in ftypeServerMap[ftype]
+    var root = bufRoots->get(bnr, {})->get(reg.id, null_string)
+    var instance = reg.instances->get(root, {})
+    if lspservers->util.Indexof((_, lspserver) => lspserver is instance) == -1
+      continue
+    endif
+    var bnrs = [bnr] + getbufinfo({bufloaded: 1})
+      ->mapnew((_, binfo) => binfo.bufnr)
+      ->filter((_, b) => b != bnr
+	&& bufRoots->get(b, {})->get(reg.id, null_string) == root
+	&& b->getbufvar('&filetype') == ftype)
+    for b in bnrs
+      if !bufRootRequests->has_key(b)
+	bufRootRequests[b] = {}
+      endif
+      bufRootRequests[b][reg.id] = true
+    endfor
+    AttachToRoot(reg, root, bnrs->mapnew((_, b) =>
+      ({bnr: b, ftype: ftype, sync: false, servers: []})))
+  endfor
+
+  # Add all the other buffers with the current file type to the servers
   AddBuffersToLsp(ftype)
 enddef
 
@@ -472,7 +517,8 @@ def StopServerByUser()
     lspserver.stoppedByUser = true
   endfor
 
-  # The removed buffers keep their other language servers
+  # The removed buffers keep their other language servers.  They are not
+  # attached to another instance of the stopped servers (see AddFile()).
   for bnr in bnrs
     if bnr->bufloaded()
       AddFile(bnr)
@@ -485,6 +531,56 @@ enddef
 export def ServerRunning(ftype: string): bool
   return !FtypeInstances(ftype)
     ->filter((_, lspserver) => lspserver.running)->empty()
+enddef
+
+# Record that the server instance "lspserver" is used now (see useCount)
+def UseServer(lspserver: dict<any>)
+  useCount += 1
+  lspserver.lastUsed = useCount
+enddef
+
+# Record that the server instances attached to the buffer "bnr" are used now
+def UseBufServers(bnr: number)
+  for lspserver in buf.BufLspServersGet(bnr)
+    if !lspserver->empty()
+      UseServer(lspserver)
+    endif
+  endfor
+enddef
+
+# Returns the workspace root directories of the running instances of the
+# language server named "name", ordered by last use (see useCount): the most
+# recently used last.  With a buffer number "bnr", the root of the instance
+# that is the origin of the buffer (see bufOrigins) is moved last.  The root
+# of an instance without a fixed root is the root it was started with.
+export def ServerRoots(name: string, bnr: number = 0): list<string>
+  var instances: dict<dict<any>> = {}
+  for regs in ftypeServerMap->values()
+    for reg in regs
+      if reg.params.name == name
+	for lspserver in reg.instances->values()
+	  if lspserver.running
+	    instances[lspserver.id] = lspserver
+	  endif
+	endfor
+      endif
+    endfor
+  endfor
+  var originId = bufOrigins->get(bnr, {})->get('id', -1)
+  return instances->values()
+    ->sort((a, b) => (a.id == originId) != (b.id == originId)
+		       ? (a.id == originId ? 1 : -1)
+		       : a.lastUsed != b.lastUsed
+		       ? a.lastUsed - b.lastUsed : a.id - b.id)
+    ->mapnew((_, lspserver) => lspserver->get('rootPath',
+				   lspserver.workspaceFolders->get(0, '')))
+enddef
+
+# Returns the workspace root directory of the buffer "bnr", computed in the
+# same way as for a language server without a "rootDir" function, with the
+# "rootSearch" file and directory names.
+export def DefaultRootDir(bnr: number, rootSearch: list<any> = []): string
+  return lserver.BufRootPath(bnr, rootSearch)
 enddef
 
 # Return server for the current buffer. Returns empty dict if there is none.
@@ -832,8 +928,14 @@ export def AddFile(bnr: number): void
     bufRootRequests[bnr] = {}
   endif
   var requests = bufRootRequests[bnr]
+  var originFound = false
   for reg in regs
     if attachedRegIds->index(reg.id) == -1 && !requests->has_key(reg.id)
+	&& !StoppedForBuffer(reg, bnr)
+      if !originFound
+	SetBufOrigin(bnr, origin.Find(bnr))
+	originFound = true
+      endif
       requests[reg.id] = true
       ResolveRoot(reg, ctx)
     endif
@@ -841,6 +943,17 @@ export def AddFile(bnr: number): void
   ctx.sync = false
 
   AttachServers(bnr, ctx.servers)
+enddef
+
+# Returns true if the server instance of the registration "reg" for the root
+# last resolved for the buffer "bnr" is stopped by the user (see ":LspServer
+# stop").  The buffer is then not attached to another instance of the
+# registration (e.g. a library file going to the most recently used one) until
+# ":LspServer start".
+def StoppedForBuffer(reg: dict<any>, bnr: number): bool
+  var root = bufRoots->get(bnr, {})->get(reg.id, null_string)
+  return root != null_string
+    && reg.instances->get(root, {})->get('stoppedByUser', false)
 enddef
 
 # Resolve the workspace root of the buffer of "ctx" for the registration
@@ -857,10 +970,55 @@ def ResolveRoot(reg: dict<any>, ctx: dict<any>)
       util.ErrMsg($'rootDir of LSP server "{reg.params.name}" failed: {v:exception}')
     endtry
   elseif PerRoot(reg)
-    OnRoot(reg, ctx, lserver.BufRootPath(ctx.bnr, reg.params.rootSearch))
+    var root = lserver.BufRootPath(ctx.bnr, reg.params.rootSearch)
+    if root->empty()
+      # An ignored root, e.g. a library file: the instance of its origin,
+      # else the most recently used running instance, else an instance
+      # without a root
+      root = OriginRoot(reg, ctx.bnr)
+    endif
+    OnRoot(reg, ctx, root)
   else
     OnRoot(reg, ctx, SHARED_ROOT)
   endif
+enddef
+
+# Record "lspserver" as the origin of the buffer "bnr" (see bufOrigins), unless
+# it is empty
+def SetBufOrigin(bnr: number, lspserver: dict<any>)
+  if !lspserver->empty()
+    bufOrigins[bnr] = lspserver
+  endif
+enddef
+
+# Returns the root of the running server instance of the registration "reg"
+# that is the origin of the buffer "bnr" (see bufOrigins), else the root of the
+# most recently used running instance (see LastUsedRoot()), else an empty
+# string
+def OriginRoot(reg: dict<any>, bnr: number): string
+  var lspserver = bufOrigins->get(bnr, {})
+  if !lspserver->empty() && lspserver.running
+    for [root, instance] in reg.instances->items()
+      if instance is lspserver
+	return root
+      endif
+    endfor
+  endif
+  return LastUsedRoot(reg)
+enddef
+
+# Returns the root of the most recently used running server instance of the
+# registration "reg" (see useCount), or an empty string if none is running
+def LastUsedRoot(reg: dict<any>): string
+  var lastRoot = ''
+  var lastUsed = -1
+  for [root, lspserver] in reg.instances->items()
+    if lspserver.running && lspserver.lastUsed > lastUsed
+      lastRoot = root
+      lastUsed = lspserver.lastUsed
+    endif
+  endfor
+  return lastRoot
 enddef
 
 # The callback of the "rootDir" function of the registration "reg", called
@@ -995,6 +1153,10 @@ def NewInstance(reg: dict<any>, root: string, config: dict<any>): dict<any>
 
   var instance = lserver.NewLspServer(params)
   instance.registrationId = reg.id
+  # Whether other instances of this registration may exist, so that the
+  # origin of a file matters (see origin.vim)
+  instance.perRoot = PerRoot(reg)
+  instance.lastUsed = 0
   if root != SHARED_ROOT
     instance.rootPath = root
   endif
@@ -1040,6 +1202,13 @@ def AttachServers(bnr: number, lspservers: list<dict<any>>)
 
     buf.BufLspServerSet(bnr, lspserver)
     attachedServers->add(lspserver)
+    # Attaching a buffer that is not current (e.g. when all the buffers are
+    # added again, or a "configForRoot" function calls back late) is not a
+    # use.  The current buffer may have been entered before its server
+    # instance was created.
+    if bnr == bufnr()
+      UseServer(lspserver)
+    endif
   endfor
 
   for lspserver in attachedServers
@@ -1122,6 +1291,9 @@ def BufferWipedOut(bnr: number)
   RemoveFile(bnr)
   if bufRoots->has_key(bnr)
     bufRoots->remove(bnr)
+  endif
+  if bufOrigins->has_key(bnr)
+    bufOrigins->remove(bnr)
   endif
 enddef
 

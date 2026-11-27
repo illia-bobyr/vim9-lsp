@@ -28,6 +28,7 @@ import './typehierarchy.vim' as typehier
 import './inlayhints.vim'
 import './semantichighlight.vim'
 import './buffer.vim' as buf
+import './origin.vim'
 
 const DIAG_PULL_DEBOUNCE_MSEC = 200
 const LSP_ERROR_SERVER_CANCELLED = -32802
@@ -1131,6 +1132,18 @@ def GotoSymbolLoc(lspserver: dict<any>, msg: string, peekSymbol: bool,
   endif
 
   var result = reply.result
+  var savedOrigin = origin.Begin(lspserver, util.LspLocationFiles(
+    result->type() == v:t_list ? result : [result]))
+  try
+    GotoSymbolResult(lspserver, msg, result, peekSymbol, cmdmods, count)
+  finally
+    origin.End(savedOrigin)
+  endtry
+enddef
+
+# Process the result "result" of the request "msg" sent by GotoSymbolLoc()
+def GotoSymbolResult(lspserver: dict<any>, msg: string, result: any,
+		     peekSymbol: bool, cmdmods: string, count: number)
   var location: dict<any>
   if result->type() == v:t_list
     if count == 0
@@ -1247,14 +1260,20 @@ def SwitchSourceHeader(lspserver: dict<any>)
   # process the 'textDocument/switchSourceHeader' reply from the LSP server
   # Result: URI | null
   var fname = util.LspUriToFile(reply.result)
-  # TODO: Add support for cmd modifiers
-  if (&modified && !&hidden) || &buftype != ''
-    # if the current buffer has unsaved changes and 'hidden' is not set,
-    # or if the current buffer is a special buffer, then ask to save changes
-    exe $'confirm edit {fname}'
-  else
-    exe $'edit {fname}'
-  endif
+  var savedOrigin = origin.Begin(lspserver, [fname])
+  try
+    # TODO: Add support for cmd modifiers
+    if (&modified && !&hidden) || &buftype != ''
+      # if the current buffer has unsaved changes and 'hidden' is not set,
+      # or if the current buffer is a special buffer, then ask to save
+      # changes
+      exe $'confirm edit {fname}'
+    else
+      exe $'edit {fname}'
+    endif
+  finally
+    origin.End(savedOrigin)
+  endtry
 enddef
 
 # get symbol signature help.
@@ -1347,15 +1366,21 @@ def ShowReferences(lspserver: dict<any>, peek: bool): void
     return
   endif
 
-  if lspserver.needOffsetEncoding
-    # Decode the position encoding in all the reference locations
-    reply.result->map((_, loc) => {
-      lspserver.decodeLocation(loc)
-      return loc
-    })
-  endif
+  var savedOrigin = origin.Begin(lspserver,
+				 util.LspLocationFiles(reply.result))
+  try
+    if lspserver.needOffsetEncoding
+      # Decode the position encoding in all the reference locations
+      reply.result->map((_, loc) => {
+	lspserver.decodeLocation(loc)
+	return loc
+      })
+    endif
 
-  symbol.ShowLocations(lspserver, reply.result, peek, 'Symbol References')
+    symbol.ShowLocations(lspserver, reply.result, peek, 'Symbol References')
+  finally
+    origin.End(savedOrigin)
+  endtry
 enddef
 
 # send custom locations request
@@ -1370,15 +1395,21 @@ def FindLocations(lspserver: dict<any>, peek: bool, method: string, args: dict<a
     return
   endif
 
-  if lspserver.needOffsetEncoding
-    # Decode the position encoding in all the reference locations
-    reply.result->map((_, loc) => {
-      lspserver.decodeLocation(loc)
-      return loc
-    })
-  endif
+  var savedOrigin = origin.Begin(lspserver,
+				 util.LspLocationFiles(reply.result))
+  try
+    if lspserver.needOffsetEncoding
+      # Decode the position encoding in all the reference locations
+      reply.result->map((_, loc) => {
+	lspserver.decodeLocation(loc)
+	return loc
+      })
+    endif
 
-  symbol.ShowLocations(lspserver, reply.result, peek, 'Symbol Locations')
+    symbol.ShowLocations(lspserver, reply.result, peek, 'Symbol Locations')
+  finally
+    origin.End(savedOrigin)
+  endtry
 enddef
 
 # send a custom request to the server
@@ -2613,15 +2644,31 @@ def TagFunc(lspserver: dict<any>, pat: string, flags: string, info: dict<any>): 
     endif
   endif
 
-  if lspserver.needOffsetEncoding
-    # Decode the position encoding in all the reference locations
-    taglocations->map((_, loc) => {
-      lspserver.decodeLocation(loc)
-      return loc
-    })
-  endif
+  var fnames = util.LspLocationFiles(taglocations)
+  var savedOrigin = origin.Begin(lspserver, fnames)
+  try
+    if lspserver->get('perRoot', false) && flags !~ 'i'
+      # Load the files now, while their origin is known: Vim opens them after
+      # this function returns.  Not for an insert mode completion, which
+      # opens none of them, nor with a single instance of the server, where
+      # the origin does not matter.
+      for fname in fnames
+	:silent! fname->bufadd()->bufload()
+      endfor
+    endif
 
-  return symbol.TagFunc(lspserver, taglocations, pat)
+    if lspserver.needOffsetEncoding
+      # Decode the position encoding in all the reference locations
+      taglocations->map((_, loc) => {
+	lspserver.decodeLocation(loc)
+	return loc
+      })
+    endif
+
+    return symbol.TagFunc(lspserver, taglocations, pat)
+  finally
+    origin.End(savedOrigin)
+  endtry
 enddef
 
 # Returns unique ID used for identifying the various servers
