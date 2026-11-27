@@ -1,5 +1,7 @@
 vim9script
 
+import './origin.vim'
+
 # Display an info message
 export def InfoMsg(msg: string)
   :echohl Question
@@ -347,6 +349,7 @@ enddef
 export def JumpToLspLocation(location: dict<any>, cmdmods: string)
   var [uri, range] = LspLocationParse(location)
   var fname = LspUriToFile(uri)
+  origin.Opening(fname)
 
   # jump to the file and line containing the symbol
   var bnr: number = fname->bufnr()

@@ -880,6 +880,66 @@ def g:Test_RootDir_LibraryFilesStop()
   Cleanup(['XU7sa', 'XU7sb', 'XU7slib'])
 enddef
 
+# U7: a library file already attached to the server instance of a root is
+# attached to the instance of another root when a location from its answer is
+# opened in it, unless the "rootDir" function knows the project of the file.
+def g:Test_RootDir_LibraryFilesRehome()
+  CreateModule('XU7ra')
+  CreateModule('XU7rb')
+  CreateModule('XU7rlib/dep', ['dep.go'])
+  # A library file whose project is known: "XU7ra"
+  CreateModule('XU7rown/dep', ['own.go'])
+  LibraryHooks('XU7rlib')
+  var LibRootDir = g:TestHooks['gopls-a'].rootDir
+  var ownCalls = 0
+  g:TestHooks['gopls-a'].rootDir = (bnr: number, OnRoot: func) => {
+    if bnr->bufname() =~ 'XU7rown'
+      ownCalls += 1
+      OnRoot('XU7ra'->fnamemodify(':p'))
+    else
+      LibRootDir(bnr, OnRoot)
+    endif
+  }
+
+  :set hidden
+  var srva = EditAndGetServer('XU7ra/main.go')
+  :split
+  var srvb = EditAndGetServer('XU7rb/main.go')
+  :wincmd j
+  symbol.GotoSymbol(srva, Location('XU7rlib/dep/dep.go'), false, '')
+  var bnr = bufnr()
+  assert_equal([srva.id], ServerIds('%'))
+  g:WaitForAssert(() => assert_true(srva.ready), 10000)
+
+  # From the window of "XU7rb", to the window with the library file
+  :wincmd k
+  symbol.GotoSymbol(srvb, Location('XU7rlib/dep/dep.go'), false, '')
+  assert_equal(bnr, bufnr())
+  assert_equal(FullPaths(['XU7ra', 'XU7rb']), libRoots)
+  assert_equal([srvb.id], ServerIds('%'))
+  assert_equal(FullPaths(['XU7ra', 'XU7rb']),
+	       lsp#lsp#ServerRoots('gopls-a', bnr))
+  assert_true(srva.running)
+  # From the same instance: nothing is resolved again
+  libRoots = []
+  symbol.GotoSymbol(srvb, Location('XU7rlib/dep/dep.go'), false, '')
+  assert_equal([], libRoots)
+  assert_equal([srvb.id], ServerIds('%'))
+
+  # The "rootDir" function knows the project: the buffer is not moved
+  :edit XU7rown/dep/own.go
+  assert_equal(1, ownCalls)
+  assert_equal([srva.id], ServerIds('%'))
+  :edit XU7rb/main.go
+  symbol.GotoSymbol(srvb, Location('XU7rown/dep/own.go'), false, '')
+  assert_equal(2, ownCalls)
+  assert_equal([srva.id], ServerIds('%'))
+
+  :set hidden&
+  :only
+  Cleanup(['XU7ra', 'XU7rb', 'XU7rlib', 'XU7rown'])
+enddef
+
 # The order of lsp#lsp#ServerRoots() after ":LspServer restart", "stop" and
 # "start": the instance of the current buffer is the most recently used.
 def g:Test_ServerRoots_Lifecycle()

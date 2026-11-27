@@ -1262,6 +1262,7 @@ def SwitchSourceHeader(lspserver: dict<any>)
   var fname = util.LspUriToFile(reply.result)
   var savedOrigin = origin.Begin(lspserver, [fname])
   try
+    origin.Opening(fname)
     # TODO: Add support for cmd modifiers
     if (&modified && !&hidden) || &buftype != ''
       # if the current buffer has unsaved changes and 'hidden' is not set,

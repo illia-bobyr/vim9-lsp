@@ -20,6 +20,9 @@ var lists: dict<dict<any>> = {}
 # Number of the lists recorded in "lists"
 var listCount = 0
 
+# The function called by Opening() for a loaded buffer, set by SetRehome()
+var Rehome: func(number, dict<any>) = null_function
+
 # Returns the full path of the file "fname"
 def FullPath(fname: string): string
   return fname->fnamemodify(':p')
@@ -43,6 +46,28 @@ enddef
 # Begin().
 export def End(saved: dict<any>)
   pending = saved
+enddef
+
+# Set the function called with a buffer number and a language server instance
+# when a file of the answer of that instance is opened in an existing buffer
+# (see Opening())
+export def SetRehome(F: func(number, dict<any>))
+  Rehome = F
+enddef
+
+# The file "fname" is opened, e.g. to go to a location.  If it is a file of
+# the answer passed to Begin(), and it has a buffer (which may be attached to
+# a server instance already), then call the function set by SetRehome(), to
+# attach the buffer to the instance of its origin.
+export def Opening(fname: string)
+  var fullName = FullPath(fname)
+  if Rehome == null_function || !pending.files->has_key(fullName)
+    return
+  endif
+  var bnr = fullName->bufnr()
+  if bnr != -1
+    Rehome(bnr, pending.server)
+  endif
 enddef
 
 # Returns the context to set for a quickfix or location list filled with the

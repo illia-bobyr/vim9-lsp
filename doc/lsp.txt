@@ -711,6 +711,15 @@ origin.  The origin from 'tagfunc' (which loads the files of its answer for
 this) and from a list is only recorded for a language server with an
 instance per root (|lsp-cfg-perRoot|).
 
+When a location from the answer of a server instance is opened in a buffer
+that is already attached to another instance of the same language server
+(e.g. a library file opened from another root before), the root of the buffer
+is resolved again with this origin (the |lsp-cfg-rootDir| function is called
+again), and the buffer is moved to the instance for that root if it is
+another one.  A "rootDir" function that knows the project of the file returns
+the same root, and the buffer is not moved.  This is not done for a location
+opened with 'tagfunc'.
+
 This can be used in a |lsp-cfg-rootDir| function to attach a library file,
 whose project is not known, to the server instance it was opened from: use
 the last root of lsp#lsp#ServerRoots({name}, {bnr}).  Without an origin, this

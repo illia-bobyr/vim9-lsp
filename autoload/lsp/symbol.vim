@@ -114,6 +114,7 @@ def JumpToWorkspaceSymbol(lspserver: dict<any>, cmdmods: string,
 
     # if the selected file is already present in a window, then jump to it
     var fname: string = symTbl[result - 1].file
+    origin.Opening(fname)
     var bnr = fname->bufnr()
     if cmdmods->empty()
       var winList: list<number> = bnr->win_findbuf()

@@ -215,6 +215,15 @@ def g:Test_ServerPerRoot_IgnoredRoot()
 			   range: {start: pos, end: pos}}, false, '')
   assert_equal('XOn/Xlib/lib4.go'->fnamemodify(':p'), expand('%:p'))
   assert_equal([srv1.id], ServerIds(['XOn/Xlib/lib4.go']))
+  # Going to it from the answer of the other instance moves it, but not a
+  # file whose root is known
+  :edit XOn/Xroot2/main.go
+  symbol.GotoSymbol(srv2, {uri: util.LspFileToUri('XOn/Xlib/lib4.go'),
+			   range: {start: pos, end: pos}}, false, '')
+  assert_equal([srv2.id], ServerIds(['XOn/Xlib/lib4.go']))
+  symbol.GotoSymbol(srv1, {uri: util.LspFileToUri('XOn/Xroot2/util.go'),
+			   range: {start: pos, end: pos}}, false, '')
+  assert_equal([srv2.id], ServerIds(['XOn/Xroot2/util.go']))
 
   StopServersAndWipe()
   g:LspOptionsSet({serverPerRoot: false,

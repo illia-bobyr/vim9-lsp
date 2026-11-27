@@ -1046,11 +1046,93 @@ def OnRoot(reg: dict<any>, ctx: dict<any>, root: string)
   if !BufferWantsServer(ctx)
     return
   endif
+  if ctx->has_key('rehome')
+    MoveToRoot(reg, ctx, root)
+    return
+  endif
   if !bufRoots->has_key(ctx.bnr)
     bufRoots[ctx.bnr] = {}
   endif
   bufRoots[ctx.bnr][reg.id] = root
   AttachToRoot(reg, root, [ctx])
+enddef
+
+# Returns the server instance of the registration "reg" attached to the buffer
+# "bnr", or an empty Dict if there is none
+def BufRegServer(bnr: number, reg: dict<any>): dict<any>
+  for lspserver in buf.BufLspServersGet(bnr)
+    if !lspserver->empty() && lspserver.registrationId == reg.id
+      return lspserver
+    endif
+  endfor
+  return {}
+enddef
+
+# A location from the answer of the server instance "lspserver" is opened in
+# the buffer "bnr" (see origin.Opening()).  If the buffer is attached to
+# another instance of the same registration, then resolve its root again,
+# with "lspserver" as its origin, and attach it to the instance for that root
+# if it is another one (see MoveToRoot()).  This moves a library file to the
+# instance it is opened from, unless the resolver knows its project.
+def RehomeBuffer(bnr: number, lspserver: dict<any>)
+  if !lspEnabled || lspserver->empty()
+    return
+  endif
+  var ftype: string = bnr->getbufvar('&filetype')
+  var regs = ftypeServerMap->get(ftype, [])->copy()
+    ->filter((_, r) => r.id == lspserver.registrationId)
+  if regs->empty() || !PerRoot(regs[0])
+    return
+  endif
+  var reg = regs[0]
+  var old = BufRegServer(bnr, reg)
+  if old->empty() || old is lspserver
+    return
+  endif
+  SetBufOrigin(bnr, lspserver)
+  if !bnr->bufloaded()
+    # A buffer that was unloaded (e.g. without 'hidden') is still attached.
+    # Detach it: it is added again when it is loaded to go to the location,
+    # with this origin.
+    RemoveFile(bnr)
+    return
+  endif
+  ResolveRoot(reg, {bnr: bnr, ftype: ftype, sync: false, servers: [],
+		    rehome: old})
+enddef
+
+# Called by OnRoot() with the workspace root "root" resolved again for the
+# buffer of "ctx" by RehomeBuffer().  If the buffer is still attached to the
+# same instance ("ctx.rehome") and the root is another one, then attach the
+# buffer to the instance for this root instead: its language servers are
+# detached and attached again, so that it has one instance of each
+# registration, and its features are initialized for all of them (see
+# BufferInit()).
+def MoveToRoot(reg: dict<any>, ctx: dict<any>, root: string)
+  var bnr = ctx.bnr
+  var old = ctx.rehome
+  if BufRegServer(bnr, reg) isnot old
+      || bufRoots->get(bnr, {})->get(reg.id, null_string) == root
+    return
+  endif
+
+  var others = buf.BufLspServersGet(bnr)->copy()
+    ->filter((_, lspserver) => !lspserver->empty() && lspserver isnot old)
+  RemoveFile(bnr)
+  # The buffer keeps its roots: they are not asked again
+  bufRootRequests[bnr] = {[reg.id]: true}
+  for lspserver in others
+    bufRootRequests[bnr][lspserver.registrationId] = true
+  endfor
+  bufRoots[bnr][reg.id] = root
+
+  var attach = {bnr: bnr, ftype: ctx.ftype, sync: true, servers: others}
+  AttachToRoot(reg, root, [attach])
+  attach.sync = false
+  # In the order of the registrations, as in AddFile()
+  var regIds = ftypeServerMap->get(ctx.ftype, [])->mapnew((_, r) => r.id)
+  AttachServers(bnr, attach.servers->sort((a, b) =>
+    regIds->index(a.registrationId) - regIds->index(b.registrationId)))
 enddef
 
 # Attach the buffers of "ctxs" (see ResolveRoot()) to the server instance of
@@ -2408,5 +2490,10 @@ export def LspServerCmd(args: string)
     util.ErrMsg($'LspServer - Unsupported argument "{args}"')
   endif
 enddef
+
+# A buffer opened from the answer of a server instance is attached to it (see
+# RehomeBuffer()).  Set at the end of the script: setting it compiles the
+# function, and the functions it calls must be defined.
+origin.SetRehome(RehomeBuffer)
 
 # vim: tabstop=8 shiftwidth=2 softtabstop=2 noexpandtab
