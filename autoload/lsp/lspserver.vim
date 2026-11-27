@@ -82,6 +82,11 @@ def StartServer(lspserver: dict<any>, bnr: number): number
 		err_cb: function(Error_cb, [lspserver]),
 		exit_cb: function(Exit_cb, [lspserver])}
 
+  # A server instance for a workspace root runs in that directory
+  if lspserver->get('rootPath', '')->isdirectory()
+    opts.cwd = lspserver.rootPath
+  endif
+
   lspserver.data = ''
   lspserver.caps = {}
   lspserver.omniCompletePending = false
@@ -178,20 +183,14 @@ def ServerInitReply(lspserver: dict<any>, initResult: dict<any>,
   endif
 enddef
 
-# Request: "initialize"
-# Param: InitializeParams
-def InitServer(lspserver: dict<any>, bnr: number)
-  # interface 'InitializeParams'
-  var initparams: dict<any> = {}
-  initparams.processId = getpid()
-  initparams.clientInfo = {
-	name: 'Vim',
-	version: v:versionlong->string(),
-      }
-
-  # Compute the rootpath (based on the directory of the buffer)
+# Returns the workspace root directory of the buffer "bnr": the nearest
+# directory above it with one of the files or directories in
+# "rootSearchFiles", else the current directory if the buffer is below it,
+# else the directory of the buffer.  The root is a full path ending in a path
+# separator, or an empty string if it is ignored (see the
+# "workspaceIgnoredPaths" option).
+export def BufRootPath(bnr: number, rootSearchFiles: list<any>): string
   var rootPath = ''
-  var rootSearchFiles = lspserver.rootSearchFiles
   var bufDir = bnr->bufname()->fnamemodify(':p:h')
   if !rootSearchFiles->empty()
     rootPath = util.FindNearestRootDir(bufDir, rootSearchFiles)
@@ -215,6 +214,26 @@ def InitServer(lspserver: dict<any>, bnr: number)
   if util.IsIgnoredRoot(rootPath, opt.lspOptions.workspaceIgnoredPaths)
     rootPath = ''
   endif
+
+  return rootPath
+enddef
+
+# Request: "initialize"
+# Param: InitializeParams
+def InitServer(lspserver: dict<any>, bnr: number)
+  # interface 'InitializeParams'
+  var initparams: dict<any> = {}
+  initparams.processId = getpid()
+  initparams.clientInfo = {
+	name: 'Vim',
+	version: v:versionlong->string(),
+      }
+
+  # A server instance for a workspace root has a fixed root.  Otherwise the
+  # root is computed from the buffer that starts the server.
+  var rootPath = lspserver->has_key('rootPath')
+    ? lspserver.rootPath
+    : BufRootPath(bnr, lspserver.rootSearchFiles)
 
   if rootPath->empty()
     lspserver.workspaceFolders = []
@@ -2651,8 +2670,6 @@ export def NewLspServer(serverParams: dict<any>): dict<any>
     sawWorkDoneProgressEnd: false,
     workDoneProgressTokens: {},
     rootSearchFiles: serverParams.rootSearch->deepcopy(),
-    runIfSearchFiles: serverParams.runIfSearch->deepcopy(),
-    runUnlessSearchFiles: serverParams.runUnlessSearch->deepcopy(),
     selection: {},
     signaturePopup: -1,
     cachedBufferContent: {},

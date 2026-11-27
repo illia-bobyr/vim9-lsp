@@ -25,8 +25,31 @@ import './inlayhints.vim'
 import './semantichighlight.vim'
 import './ontypeformat.vim'
 
-# filetype to LSP server map
+# The language servers registered for each file type.  A registration is a
+# template for its server instances:
+#   id:        unique number
+#   params:    the language server information passed to AddServer(), as
+#              normalized by NormalizeServer()
+#   instances: the server instances, keyed by workspace root directory.  When
+#              there is no instance per root (see PerRoot()), the single
+#              instance is keyed by SHARED_ROOT, and its root is computed from
+#              the buffer that starts it.
+# A registration with several file types is in the list of each of them, and
+# its instances serve all of them.
 var ftypeServerMap: dict<list<dict<any>>> = {}
+
+# Number of registrations, used for their ids
+var registrationCount = 0
+
+# The key of the single instance of a registration without an instance per
+# root.  A root is a full path, or an empty string, so it cannot be equal.
+const SHARED_ROOT = '*'
+
+# The root resolved for each buffer by each registration: maps a buffer
+# number to a dict of registration id -> key in the "instances" of the
+# registration.  Used to find the server instances of a buffer which is not
+# attached to them, e.g. after ":LspServer stop".
+var bufRoots: dict<dict<string>> = {}
 
 var lspInitializedOnce = false
 var lspUserSetupOnce = false
@@ -65,7 +88,7 @@ def RegisterEvents()
     autocmd BufNewFile,BufReadPost,FileType * AddFile(expand('<abuf>')->str2nr())
     # Note that when BufWipeOut is invoked, the current buffer may be different
     # from the buffer getting wiped out.
-    autocmd BufWipeOut * RemoveFile(expand('<abuf>')->str2nr())
+    autocmd BufWipeOut * BufferWipedOut(expand('<abuf>')->str2nr())
     autocmd BufWinEnter * BufferLoadedInWin(expand('<abuf>')->str2nr())
     # Pull fresh diagnostics when a file is modified outside Vim and reloaded
     autocmd FileChangedShellPost * BufferExternallyChanged(expand('<abuf>')->str2nr())
@@ -114,9 +137,9 @@ export def LspDisable()
   lspEnabled = false
 enddef
 
-# Returns the LSP servers for the a specific filetype. Based on how well there
-# score, LSP servers with the same score are being returned.
-# Returns an empty list if the servers is not found.
+# Returns the registrations of the language servers for the file type "ftype"
+# that can be used for the buffer "bnr" (see "runIfSearch" and
+# "runUnlessSearch").  Returns an empty list if there are none.
 def LspGetServers(bnr: number, ftype: string): list<dict<any>>
   if !ftypeServerMap->has_key(ftype)
     return []
@@ -126,10 +149,10 @@ def LspGetServers(bnr: number, ftype: string): list<dict<any>>
 
   var servermap: list<dict<any>> = ftypeServerMap[ftype]->copy()
 
-  return servermap->filter((key, lspserver) => {
+  return servermap->filter((key, reg) => {
     # Don't run the server if no path is found
-    if !lspserver.runIfSearchFiles->empty()
-      var path = util.FindNearestRootDir(bufDir, lspserver.runIfSearchFiles)
+    if !reg.params.runIfSearch->empty()
+      var path = util.FindNearestRootDir(bufDir, reg.params.runIfSearch)
 
       if path->empty()
         return false
@@ -137,8 +160,8 @@ def LspGetServers(bnr: number, ftype: string): list<dict<any>>
     endif
 
     # Don't run the server if a path is found
-    if !lspserver.runUnlessSearchFiles->empty()
-      var path = util.FindNearestRootDir(bufDir, lspserver.runUnlessSearchFiles)
+    if !reg.params.runUnlessSearch->empty()
+      var path = util.FindNearestRootDir(bufDir, reg.params.runUnlessSearch)
 
       if !path->empty()
         return false
@@ -150,16 +173,46 @@ def LspGetServers(bnr: number, ftype: string): list<dict<any>>
   })
 enddef
 
-# Add a LSP server for a filetype
-def LspAddServer(ftype: string, lspsrv: dict<any>)
-  var lspsrvlst = ftypeServerMap->has_key(ftype) ? ftypeServerMap[ftype] : []
+# Add a LSP server registration for a filetype
+def LspAddServer(ftype: string, reg: dict<any>)
+  var reglst = ftypeServerMap->has_key(ftype) ? ftypeServerMap[ftype] : []
   # Prevent duplicate registration of the same server name per filetype.
-  if util.Indexof(lspsrvlst, (_, v) => v.name == lspsrv.name) != -1
+  if util.Indexof(reglst, (_, v) => v.params.name == reg.params.name) != -1
       # LSP server already added for this file type
       return
   endif
-  lspsrvlst->add(lspsrv)
-  ftypeServerMap[ftype] = lspsrvlst
+  reglst->add(reg)
+  ftypeServerMap[ftype] = reglst
+enddef
+
+# Returns true if the registration "reg" has a server instance per workspace
+# root
+def PerRoot(reg: dict<any>): bool
+  return opt.lspOptions.serverPerRoot
+enddef
+
+# Returns the server instances of the registrations for the file type "ftype"
+# for the roots resolved for the buffer "bnr", whether the buffer is attached
+# to them or not.
+def BufInstances(bnr: number, ftype: string): list<dict<any>>
+  var roots = bufRoots->get(bnr, {})
+  var instances: list<dict<any>> = []
+  for reg in ftypeServerMap->get(ftype, [])
+    if roots->has_key(reg.id) && reg.instances->has_key(roots[reg.id])
+      instances->add(reg.instances[roots[reg.id]])
+    endif
+  endfor
+  return instances
+enddef
+
+# Returns all the server instances of the registrations for the file type
+# "ftype"
+def FtypeInstances(ftype: string): list<dict<any>>
+  var instances: list<dict<any>> = []
+  for reg in ftypeServerMap->get(ftype, [])
+    instances->extend(reg.instances->values())
+  endfor
+  return instances
 enddef
 
 # Enable/disable the logging of the language server protocol messages
@@ -196,13 +249,20 @@ export def ShowAllServers()
   # Add filetype to server mapping information
   lines->add('Filetype Information')
   lines->add('====================')
-  for [ftype, lspservers] in ftypeServerMap->items()
-    for lspserver in lspservers
-      lines->add($"Filetype: '{ftype}'")
-      lines->add($"Server Name: '{lspserver.name}'")
-      lines->add($"Server Path: '{lspserver.path}'")
-      lines->add($"Status: {lspserver.running ? 'Running' : 'Not running'}")
-      lines->add('')
+  for [ftype, regs] in ftypeServerMap->items()
+    for reg in regs
+      # A registration without instances is shown as not running
+      for lspserver in reg.instances->empty() ? [reg.params]
+					      : reg.instances->values()
+	lines->add($"Filetype: '{ftype}'")
+	lines->add($"Server Name: '{lspserver.name}'")
+	lines->add($"Server Path: '{lspserver.path}'")
+	if lspserver->has_key('rootPath')
+	  lines->add($"Server Root: '{lspserver.rootPath}'")
+	endif
+	lines->add($"Status: {lspserver->get('running', false) ? 'Running' : 'Not running'}")
+	lines->add('')
+      endfor
     endfor
   endfor
 
@@ -278,7 +338,11 @@ def ShowServer(arg: string)
       if !lines->empty()
         lines->extend(['', repeat('=', &columns), ''])
       endif
-      var msg = $"LSP server '{lspserver.name}' is "
+      var msg = $"LSP server '{lspserver.name}' "
+      if lspserver->has_key('rootPath')
+        msg ..= $"for root '{lspserver.rootPath}' "
+      endif
+      msg ..= 'is '
       if lspserver.running
         msg ..= 'running'
       else
@@ -327,48 +391,57 @@ def ShowServer(arg: string)
   endif
 enddef
 
-# Server start requested by the user for the file type in the current buffer
+# Server start requested by the user for the file type in the current buffer.
+# Starts the server instances for the roots of the current buffer.
 def StartServerByUser()
   var ftype: string = &filetype
 
-  var lspservers = ftypeServerMap->get(ftype, [])
-
-  if lspservers->empty()
+  if ftypeServerMap->get(ftype, [])->empty()
     util.WarnMsg($'No Lsp servers found for "{@%}"')
     return
   endif
 
-  # Update the list of servers attached to the current file type
-  for lspserver in lspservers
+  for lspserver in BufInstances(bufnr(), ftype)
     lspserver.stoppedByUser = false
   endfor
 
-  # Add all the buffers with the current file type to the server
+  # Add all the buffers with the current file type to the servers
   AddBuffersToLsp(ftype)
 enddef
 
-# Server stop requested by the user for the file type in the current buffer
+# Remove the buffers attached to the server instances "lspservers".  Returns
+# the numbers of the removed buffers.
+def RemoveServerBuffers(lspservers: list<dict<any>>): list<number>
+  var bnrs: list<number> = []
+  for lspserver in lspservers
+    for bnr in buf.BufGetServerBufnrs(lspserver)
+      RemoveFile(bnr)
+      bnrs->add(bnr)
+    endfor
+  endfor
+  return bnrs
+enddef
+
+# Server stop requested by the user for the file type in the current buffer.
+# Stops the server instances for the roots of the current buffer.
 def StopServerByUser()
-  var lspservers: list<dict<any>> = buf.CurbufGetServers()->copy()
+  var lspservers = BufInstances(bufnr(), &filetype)
+    ->filter((_, lspserver) => lspserver.running)
   if lspservers->empty()
     util.WarnMsg($'No Lsp servers found for "{@%}"')
     return
   endif
 
-  # Remove all the buffers with the same file type as the current buffer
-  var ftype: string = &filetype
-  for binfo in getbufinfo()
-    if binfo.bufnr->getbufvar('&filetype') == ftype
-      RemoveFile(binfo.bufnr)
-    endif
+  var bnrs = RemoveServerBuffers(lspservers)
+  for lspserver in lspservers
+    lspserver.stopServer()
+    lspserver.stoppedByUser = true
   endfor
 
-  # Stop all the servers for this file type
-  for lspserver in lspservers
-    # Stop the server (if running)
-    if lspserver.running
-      lspserver.stopServer()
-      lspserver.stoppedByUser = true
+  # The removed buffers keep their other language servers
+  for bnr in bnrs
+    if bnr->bufloaded()
+      AddFile(bnr)
     endif
   endfor
 enddef
@@ -376,16 +449,8 @@ enddef
 # Get LSP server running status for filetype "ftype"
 # Return true if running, or false if not found or not running
 export def ServerRunning(ftype: string): bool
-  if ftypeServerMap->has_key(ftype)
-    var lspservers = ftypeServerMap[ftype]
-    for lspserver in lspservers
-      if lspserver.running
-        return true
-      endif
-    endfor
-  endif
-
-  return false
+  return !FtypeInstances(ftype)
+    ->filter((_, lspserver) => lspserver.running)->empty()
 enddef
 
 # Return server for the current buffer. Returns empty dict if there is none.
@@ -708,12 +773,88 @@ export def AddFile(bnr: number): void
   if ftype->empty()
     return
   endif
-  var lspservers: list<dict<any>> = LspGetServers(bnr, ftype)
-  if lspservers->empty()
+  var regs: list<dict<any>> = LspGetServers(bnr, ftype)
+  if regs->empty()
     return
   endif
 
-  # Start all the lsp servers registered for this buffer file type (if needed)
+  # The server instances found before AddFile() returns are attached together,
+  # in the order of the registrations, so that the features are initialized
+  # with the capabilities of all of them (see BufferInit()).
+  var ctx = {bnr: bnr, ftype: ftype, sync: true, servers: []}
+  var attachedRegIds: list<number> = buf.BufLspServersGet(bnr)
+    ->copy()
+    ->filter((_, lspsrv) => !lspsrv->empty())
+    ->map((_, lspsrv) => lspsrv.registrationId)
+  for reg in regs
+    if attachedRegIds->index(reg.id) == -1
+      ResolveRoot(reg, ctx)
+    endif
+  endfor
+  ctx.sync = false
+
+  AttachServers(bnr, ctx.servers)
+enddef
+
+# Resolve the workspace root of the buffer of "ctx" for the registration
+# "reg", and attach the buffer to the server instance for that root.  "ctx"
+# has the buffer number ("bnr"), its file type ("ftype"), and the server
+# instances to attach when called from AddFile() ("sync" and "servers").
+def ResolveRoot(reg: dict<any>, ctx: dict<any>)
+  if PerRoot(reg)
+    OnRoot(reg, ctx, lserver.BufRootPath(ctx.bnr, reg.params.rootSearch))
+  else
+    OnRoot(reg, ctx, SHARED_ROOT)
+  endif
+enddef
+
+# Called with the workspace root "root" of the buffer of "ctx" for the
+# registration "reg", or with SHARED_ROOT
+def OnRoot(reg: dict<any>, ctx: dict<any>, root: string)
+  if !bufRoots->has_key(ctx.bnr)
+    bufRoots[ctx.bnr] = {}
+  endif
+  bufRoots[ctx.bnr][reg.id] = root
+  AttachToRoot(reg, root, [ctx])
+enddef
+
+# Attach the buffers of "ctxs" (see ResolveRoot()) to the server instance of
+# the registration "reg" for the root "root", after creating it if needed
+def AttachToRoot(reg: dict<any>, root: string, ctxs: list<dict<any>>)
+  var instance = reg.instances->get(root, {})
+  if instance->empty()
+    instance = NewInstance(reg, root)
+  endif
+  for ctx in ctxs
+    AttachInstance(instance, ctx)
+  endfor
+enddef
+
+# Create the server instance of the registration "reg" for the root "root"
+def NewInstance(reg: dict<any>, root: string): dict<any>
+  var instance = lserver.NewLspServer(reg.params)
+  instance.registrationId = reg.id
+  if root != SHARED_ROOT
+    instance.rootPath = root
+  endif
+  reg.instances[root] = instance
+  return instance
+enddef
+
+# Attach the server instance "instance" to the buffer of "ctx" (see
+# ResolveRoot())
+def AttachInstance(instance: dict<any>, ctx: dict<any>)
+  if !ctx.sync
+    AttachServers(ctx.bnr, [instance])
+  elseif ctx.servers->util.Indexof((_, srv) => srv.id == instance.id) == -1
+    ctx.servers->add(instance)
+  endif
+enddef
+
+# Attach the server instances "lspservers" to the buffer "bnr", and start the
+# ones that are not running
+def AttachServers(bnr: number, lspservers: list<dict<any>>)
+  # Start the servers (if needed)
   var attachedServerIds: list<number> = buf.BufLspServersGet(bnr)
     ->copy()
     ->filter((_, lspsrv) => !lspsrv->empty())
@@ -811,6 +952,14 @@ export def RemoveFile(bnr: number): void
   endif
 enddef
 
+# The buffer "bnr" is wiped out
+def BufferWipedOut(bnr: number)
+  RemoveFile(bnr)
+  if bufRoots->has_key(bnr)
+    bufRoots->remove(bnr)
+  endif
+enddef
+
 # Buffer 'bnr' is loaded in a window, refresh visuals and UI state.
 export def BufferLoadedInWin(bnr: number)
   var lspservers: list<dict<any>> = buf.BufLspServersGet(bnr)
@@ -869,8 +1018,8 @@ enddef
 
 # Send shutdown/exit to all the LSP servers (fast for vim exit)
 export def FastShutdownExitAllServers()
-  for lspservers in ftypeServerMap->values()
-    for lspserver in lspservers
+  for regs in ftypeServerMap->values()
+    for lspserver in regs->mapnew((_, reg) => reg.instances->values())->flattennew()
       if lspserver.running
 	FastShutdownServer(lspserver)
 	lspserver.exitServer()
@@ -891,41 +1040,61 @@ def AddBuffersToLsp(ftype: string)
   endfor
 enddef
 
-# Restart the LSP server for the current buffer
+# Restart the LSP server instances for the roots of the current buffer.  Each
+# instance is replaced with a new one, attached to the buffers of the old one.
 def RestartServer()
   var ftype: string = &filetype
+  var bnr = bufnr()
 
-  var lspservers = ftypeServerMap->get(ftype, [])
-
-  if lspservers->empty()
+  var regs = ftypeServerMap->get(ftype, [])
+  if regs->empty()
     util.WarnMsg($'No Lsp servers found for "{@%}"')
     return
   endif
 
-  # Remove all the buffers with the same file type as the current buffer
-  for binfo in getbufinfo()
-    if binfo.bufnr->getbufvar('&filetype') == ftype
-      RemoveFile(binfo.bufnr)
+  var roots = bufRoots->get(bnr, {})
+  var removedBufs: list<number> = []
+  for reg in regs
+    var root = roots->get(reg.id, null_string)
+    if !reg.instances->has_key(root)
+      continue
     endif
-  endfor
-
-  for lspserver in lspservers
-    # Stop the server (if running)
+    # Forget the old instance before stopping it: stopping waits for the
+    # server, and a buffer added meanwhile must get the new instance.
+    var lspserver = reg.instances->remove(root)
+    var debug = lspserver.debug
+    var bnrs = RemoveServerBuffers([lspserver])
     if lspserver.running
       lspserver.stopServer()
     endif
-    lspserver.stoppedByUser = false
 
-    # Start the server again
-    lspserver.startServer(bufnr())
+    # The current buffer first: it starts a server without a root per
+    # instance (see InitServer()).
+    var ctxs = ([bnr] + bnrs->copy()->filter((_, b) => b != bnr))
+      ->filter((_, b) => b->bufloaded())
+      ->mapnew((_, b) => ({bnr: b, ftype: b->getbufvar('&filetype'),
+			   sync: false, servers: []}))
+    AttachToRoot(reg, root, ctxs)
+    # Keep the debug setting (see ":LspServer debug"), unless the new
+    # instance is created later
+    if reg.instances->has_key(root)
+      reg.instances[root].debug = debug
+    endif
+    removedBufs->extend(bnrs)
   endfor
 
+  # The other buffers, and the other language servers of the removed buffers
   AddBuffersToLsp(ftype)
+  for b in removedBufs
+    if b->bufloaded() && b->getbufvar('&filetype') != ftype
+      AddFile(b)
+    endif
+  endfor
 enddef
 
-# Add the LSP server for files with 'filetype' as "ftype".
-def AddServerForFiltype(lspserver: dict<any>, ftype: string, omnicompl: bool)
-  LspAddServer(ftype, lspserver)
+# Add the LSP server registration "reg" for files with 'filetype' as "ftype".
+def AddServerForFiltype(reg: dict<any>, ftype: string, omnicompl: bool)
+  LspAddServer(ftype, reg)
   completion.OmniComplSet(ftype, omnicompl)
 
   # If a buffer of this file type is already present, then send it to the LSP
@@ -1072,20 +1241,22 @@ export def AddServer(serverList: list<dict<any>>)
       continue
     endif
 
-    # Freeze normalized config into a concrete server instance.
-    var lspserver: dict<any> = lserver.NewLspServer(server)
-
     var ftypes = server.filetype
     if ftypes->type() == v:t_string
-      AddServerForFiltype(lspserver, ftypes, server.omnicompl)
-    elseif ftypes->type() == v:t_list
-      for ftype in ftypes
-	AddServerForFiltype(lspserver, ftype, server.omnicompl)
-      endfor
-    else
+      ftypes = [ftypes]
+    elseif ftypes->type() != v:t_list
       util.ErrMsg($'Unsupported file type information "{ftypes->string()}" in LSP server registration')
       continue
     endif
+
+    # The server instances are created when they are needed (see
+    # AttachToRoot()), from a copy of the settings taken now
+    registrationCount += 1
+    var reg = {id: registrationCount, params: server->deepcopy(),
+	       instances: {}}
+    for ftype in ftypes
+      AddServerForFiltype(reg, ftype, server.omnicompl)
+    endfor
   endfor
 enddef
 
