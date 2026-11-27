@@ -933,132 +933,143 @@ def AddServerForFiltype(lspserver: dict<any>, ftype: string, omnicompl: bool)
   AddBuffersToLsp(ftype)
 enddef
 
-# Register a LSP server for one or more file types
-export def AddServer(serverList: list<dict<any>>)
-  for server in serverList
-    if !server->has_key('filetype') || !server->has_key('path')
-      util.ErrMsg('LSP server information is missing filetype or path')
-      continue
-    endif
-    # Enable omni-completion by default when auto-complete is disabled, unless
-    # the user explicitly overrides this per server.
-    var omnicompl_def: bool = false
-    if opt.lspOptions.omniComplete == true
+# Validate the language server information "server", and set the default
+# values expected by NewLspServer(), in place.  Returns false (after showing an
+# error message) if the information is not valid.
+def NormalizeServer(server: dict<any>): bool
+  if !server->has_key('filetype') || !server->has_key('path')
+    util.ErrMsg('LSP server information is missing filetype or path')
+    return false
+  endif
+  # Enable omni-completion by default when auto-complete is disabled, unless
+  # the user explicitly overrides this per server.
+  var omnicompl_def: bool = false
+  if opt.lspOptions.omniComplete == true
 	|| (opt.lspOptions.omniComplete == null
 	    && !opt.lspOptions.autoComplete)
-      omnicompl_def = true
-    endif
-    server.omnicompl = server->get('omnicompl', omnicompl_def)
+    omnicompl_def = true
+  endif
+  server.omnicompl = server->get('omnicompl', omnicompl_def)
 
-    server.path = expandcmd(server.path)
+  server.path = expandcmd(server.path)
 
-    # Skip missing executables unless user opted into silent ignore.
-    if !server.path->executable()
-      if !opt.lspOptions.ignoreMissingServer
-        util.ErrMsg($'LSP server {server.path} is not found')
-      endif
-      continue
+  # Skip missing executables unless user opted into silent ignore.
+  if !server.path->executable()
+    if !opt.lspOptions.ignoreMissingServer
+      util.ErrMsg($'LSP server {server.path} is not found')
     endif
-    if server->has_key('args')
-      if server.args->type() != v:t_list
-        util.ErrMsg($'Arguments for LSP server {server.args} is not a List')
-        continue
-      endif
-    else
-      server.args = []
+    return false
+  endif
+  if server->has_key('args')
+    if server.args->type() != v:t_list
+      util.ErrMsg($'Arguments for LSP server {server.args} is not a List')
+      return false
     endif
+  else
+    server.args = []
+  endif
 
-    # Normalize optional fields to canonical types expected by NewLspServer().
-    if !server->has_key('initializationOptions')
+  # Normalize optional fields to canonical types expected by NewLspServer().
+  if !server->has_key('initializationOptions')
 	|| server.initializationOptions->type() != v:t_dict
-      server.initializationOptions = {}
-    endif
+    server.initializationOptions = {}
+  endif
 
-    if !server->has_key('clientCapabilities')
+  if !server->has_key('clientCapabilities')
 	|| server.clientCapabilities->type() != v:t_dict
-      server.clientCapabilities = {}
-    endif
+    server.clientCapabilities = {}
+  endif
 
-    if !server->has_key('forceOffsetEncoding')
+  if !server->has_key('forceOffsetEncoding')
 	|| server.forceOffsetEncoding->type() != v:t_string
 	|| (server.forceOffsetEncoding != 'utf-8'
 	    && server.forceOffsetEncoding != 'utf-16'
 	    && server.forceOffsetEncoding != 'utf-32')
-      server.forceOffsetEncoding = ''
-    endif
+    server.forceOffsetEncoding = ''
+  endif
 
-    if !server->has_key('customNotificationHandlers')
+  if !server->has_key('customNotificationHandlers')
 	|| server.customNotificationHandlers->type() != v:t_dict
-      server.customNotificationHandlers = {}
-    endif
+    server.customNotificationHandlers = {}
+  endif
 
-    if server->has_key('processDiagHandler')
-      if server.processDiagHandler->type() != v:t_func
-        util.ErrMsg($'Setting of processDiagHandler {server.processDiagHandler} is not a Funcref nor lambda')
-        continue
-      endif
-    else
-      server.processDiagHandler = null_function
+  if server->has_key('processDiagHandler')
+    if server.processDiagHandler->type() != v:t_func
+      util.ErrMsg($'Setting of processDiagHandler {server.processDiagHandler} is not a Funcref nor lambda')
+      return false
     endif
+  else
+    server.processDiagHandler = null_function
+  endif
 
-    if !server->has_key('customRequestHandlers')
+  if !server->has_key('customRequestHandlers')
 	|| server.customRequestHandlers->type() != v:t_dict
-      server.customRequestHandlers = {}
-    endif
+    server.customRequestHandlers = {}
+  endif
 
-    if !server->has_key('features') || server.features->type() != v:t_dict
-      server.features = {}
-    endif
+  if !server->has_key('features') || server.features->type() != v:t_dict
+    server.features = {}
+  endif
 
-    if server.omnicompl->type() != v:t_bool
-      util.ErrMsg($'Setting of omnicompl {server.omnicompl} is not a Boolean')
-      continue
-    endif
+  if server.omnicompl->type() != v:t_bool
+    util.ErrMsg($'Setting of omnicompl {server.omnicompl} is not a Boolean')
+    return false
+  endif
 
-    if !server->has_key('syncInit')
-      server.syncInit = false
-    endif
+  if !server->has_key('syncInit')
+    server.syncInit = false
+  endif
 
-    if !server->has_key('name') || server.name->type() != v:t_string
+  if !server->has_key('name') || server.name->type() != v:t_string
 	|| server.name->empty()
-      # Use the executable name (without the extension) as the language server
-      # name.
-      server.name = server.path->fnamemodify(':t:r')
-    endif
+    # Use the executable name (without the extension) as the language server
+    # name.
+    server.name = server.path->fnamemodify(':t:r')
+  endif
 
-    if !server->has_key('debug') || server.debug->type() != v:t_bool
-      server.debug = false
-    endif
+  if !server->has_key('debug') || server.debug->type() != v:t_bool
+    server.debug = false
+  endif
 
-    if !server->has_key('traceLevel')
+  if !server->has_key('traceLevel')
 	|| server.traceLevel->type() != v:t_string
 	|| (server.traceLevel != 'off' && server.traceLevel != 'debug'
 	    && server.traceLevel != 'verbose')
-      server.traceLevel = 'off'
-    endif
+    server.traceLevel = 'off'
+  endif
 
-    if !server->has_key('workspaceConfig')
+  if !server->has_key('workspaceConfig')
 	|| server.workspaceConfig->type() != v:t_dict
-      server.workspaceConfig = {}
-    endif
+    server.workspaceConfig = {}
+  endif
 
-    if !server->has_key('rootSearch') || server.rootSearch->type() != v:t_list
-      server.rootSearch = []
-    endif
+  if !server->has_key('rootSearch') || server.rootSearch->type() != v:t_list
+    server.rootSearch = []
+  endif
 
-    if !server->has_key('runIfSearch') ||
+  if !server->has_key('runIfSearch') ||
 	server.runIfSearch->type() != v:t_list
-      server.runIfSearch = []
-    endif
+    server.runIfSearch = []
+  endif
 
-    if !server->has_key('runUnlessSearch') ||
+  if !server->has_key('runUnlessSearch') ||
 	server.runUnlessSearch->type() != v:t_list
-      server.runUnlessSearch = []
-    endif
+    server.runUnlessSearch = []
+  endif
 
-    if !server->has_key('languageId') ||
+  if !server->has_key('languageId') ||
 	server.languageId->type() != v:t_func
-      server.languageId = v:none
+    server.languageId = v:none
+  endif
+
+  return true
+enddef
+
+# Register a LSP server for one or more file types
+export def AddServer(serverList: list<dict<any>>)
+  for server in serverList
+    if !NormalizeServer(server)
+      continue
     endif
 
     # Freeze normalized config into a concrete server instance.
