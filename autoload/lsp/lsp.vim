@@ -34,6 +34,10 @@ import './ontypeformat.vim'
 #              there is no instance per root (see PerRoot()), the single
 #              instance is keyed by SHARED_ROOT, and its root is computed from
 #              the buffer that starts it.
+#   pending:   the roots whose "configForRoot" function has not called back
+#              yet, see RequestInstance()
+#   perRoot:   true if there is a server instance per root, set by PerRoot()
+#              when the first buffer is resolved
 # A registration with several file types is in the list of each of them, and
 # its instances serve all of them.
 var ftypeServerMap: dict<list<dict<any>>> = {}
@@ -50,6 +54,20 @@ const SHARED_ROOT = '*'
 # registration.  Used to find the server instances of a buffer which is not
 # attached to them, e.g. after ":LspServer stop".
 var bufRoots: dict<dict<string>> = {}
+
+# The registrations that asked for the root of each buffer: maps a buffer
+# number to a dict of registration id -> true.  A buffer is added on both
+# BufReadPost and FileType, and this avoids calling the "rootDir" and
+# "configForRoot" functions twice for a buffer they don't attach a server
+# to.  Forgotten on FileType (e.g. after ":edit" or ":set filetype"), when
+# the buffer is removed, and by ":LspServer restart" and "start", to ask
+# again.
+var bufRootRequests: dict<dict<bool>> = {}
+
+# The settings of a registration that a "configForRoot" function cannot
+# override: they are used before a server instance exists.
+const REGISTRATION_KEYS = ['configForRoot', 'filetype', 'name', 'omnicompl',
+  'perRoot', 'rootDir', 'rootSearch', 'runIfSearch', 'runUnlessSearch']
 
 var lspInitializedOnce = false
 var lspUserSetupOnce = false
@@ -85,7 +103,8 @@ enddef
 def RegisterEvents()
   augroup LspAutoCmds
     autocmd!
-    autocmd BufNewFile,BufReadPost,FileType * AddFile(expand('<abuf>')->str2nr())
+    autocmd BufNewFile,BufReadPost * AddFile(expand('<abuf>')->str2nr())
+    autocmd FileType * FileTypeSet(expand('<abuf>')->str2nr())
     # Note that when BufWipeOut is invoked, the current buffer may be different
     # from the buffer getting wiped out.
     autocmd BufWipeOut * BufferWipedOut(expand('<abuf>')->str2nr())
@@ -186,9 +205,16 @@ def LspAddServer(ftype: string, reg: dict<any>)
 enddef
 
 # Returns true if the registration "reg" has a server instance per workspace
-# root
+# root.  This is decided when the first buffer is resolved, and does not change
+# afterwards, so that changing the "serverPerRoot" option does not mix shared
+# and per-root instances.
 def PerRoot(reg: dict<any>): bool
-  return opt.lspOptions.serverPerRoot
+  if !reg->has_key('perRoot')
+    reg.perRoot = reg.params->has_key('rootDir')
+      || reg.params->has_key('configForRoot')
+      || reg.params->get('perRoot', opt.lspOptions.serverPerRoot)
+  endif
+  return reg.perRoot
 enddef
 
 # Returns the server instances of the registrations for the file type "ftype"
@@ -252,8 +278,8 @@ export def ShowAllServers()
   for [ftype, regs] in ftypeServerMap->items()
     for reg in regs
       # A registration without instances is shown as not running
-      for lspserver in reg.instances->empty() ? [reg.params]
-					      : reg.instances->values()
+      var noInstances = reg.instances->empty() && reg.pending->empty()
+      for lspserver in noInstances ? [reg.params] : reg.instances->values()
 	lines->add($"Filetype: '{ftype}'")
 	lines->add($"Server Name: '{lspserver.name}'")
 	lines->add($"Server Path: '{lspserver.path}'")
@@ -261,6 +287,13 @@ export def ShowAllServers()
 	  lines->add($"Server Root: '{lspserver.rootPath}'")
 	endif
 	lines->add($"Status: {lspserver->get('running', false) ? 'Running' : 'Not running'}")
+	lines->add('')
+      endfor
+      for root in reg.pending->keys()
+	lines->add($"Filetype: '{ftype}'")
+	lines->add($"Server Name: '{reg.params.name}'")
+	lines->add($"Server Root: '{root}'")
+	lines->add('Status: Waiting for configForRoot')
 	lines->add('')
       endfor
     endfor
@@ -406,6 +439,7 @@ def StartServerByUser()
   endfor
 
   # Add all the buffers with the current file type to the servers
+  ForgetRootRequests(ftype)
   AddBuffersToLsp(ftype)
 enddef
 
@@ -756,6 +790,14 @@ def BufferInit(lspserverId: number, bnr: number): void
   endif
 enddef
 
+# The 'filetype' option is set for the buffer "bnr"
+def FileTypeSet(bnr: number)
+  if bufRootRequests->has_key(bnr)
+    bufRootRequests->remove(bnr)
+  endif
+  AddFile(bnr)
+enddef
+
 # A new buffer is opened. If LSP is supported for this buffer, then add it
 export def AddFile(bnr: number): void
   # Skip remote files
@@ -786,8 +828,13 @@ export def AddFile(bnr: number): void
     ->copy()
     ->filter((_, lspsrv) => !lspsrv->empty())
     ->map((_, lspsrv) => lspsrv.registrationId)
+  if !bufRootRequests->has_key(bnr)
+    bufRootRequests[bnr] = {}
+  endif
+  var requests = bufRootRequests[bnr]
   for reg in regs
-    if attachedRegIds->index(reg.id) == -1
+    if attachedRegIds->index(reg.id) == -1 && !requests->has_key(reg.id)
+      requests[reg.id] = true
       ResolveRoot(reg, ctx)
     endif
   endfor
@@ -797,20 +844,50 @@ export def AddFile(bnr: number): void
 enddef
 
 # Resolve the workspace root of the buffer of "ctx" for the registration
-# "reg", and attach the buffer to the server instance for that root.  "ctx"
-# has the buffer number ("bnr"), its file type ("ftype"), and the server
-# instances to attach when called from AddFile() ("sync" and "servers").
+# "reg", and attach the buffer to the server instance for that root, now or
+# later.  "ctx" has the buffer number ("bnr"), its file type ("ftype"), and
+# the server instances to attach when called from AddFile() ("sync" and
+# "servers").
 def ResolveRoot(reg: dict<any>, ctx: dict<any>)
-  if PerRoot(reg)
+  if reg.params->has_key('rootDir')
+    try
+      var RootDir = reg.params.rootDir
+      RootDir(ctx.bnr, function(OnRootDir, [reg, ctx]))
+    catch
+      util.ErrMsg($'rootDir of LSP server "{reg.params.name}" failed: {v:exception}')
+    endtry
+  elseif PerRoot(reg)
     OnRoot(reg, ctx, lserver.BufRootPath(ctx.bnr, reg.params.rootSearch))
   else
     OnRoot(reg, ctx, SHARED_ROOT)
   endif
 enddef
 
+# The callback of the "rootDir" function of the registration "reg", called
+# with the workspace root "root" of the buffer of "ctx"
+def OnRootDir(reg: dict<any>, ctx: dict<any>, root: any)
+  if root->type() != v:t_string
+    util.ErrMsg($'rootDir of LSP server "{reg.params.name}" returned a root that is not a String: {root->string()}')
+    return
+  endif
+  OnRoot(reg, ctx, root->empty() ? '' : root->fnamemodify(':p'))
+enddef
+
+# Returns true if the buffer of "ctx" (see ResolveRoot()) can still be
+# attached to a server instance when a "rootDir" or "configForRoot" function
+# calls back after AddFile() returned: it is loaded and its file type is the
+# same.
+def BufferWantsServer(ctx: dict<any>): bool
+  return ctx.sync || (lspEnabled && ctx.bnr->bufloaded()
+		      && ctx.bnr->getbufvar('&filetype') == ctx.ftype)
+enddef
+
 # Called with the workspace root "root" of the buffer of "ctx" for the
 # registration "reg", or with SHARED_ROOT
 def OnRoot(reg: dict<any>, ctx: dict<any>, root: string)
+  if !BufferWantsServer(ctx)
+    return
+  endif
   if !bufRoots->has_key(ctx.bnr)
     bufRoots[ctx.bnr] = {}
   endif
@@ -819,11 +896,75 @@ def OnRoot(reg: dict<any>, ctx: dict<any>, root: string)
 enddef
 
 # Attach the buffers of "ctxs" (see ResolveRoot()) to the server instance of
-# the registration "reg" for the root "root", after creating it if needed
+# the registration "reg" for the root "root", now if it exists, else when it
+# is created (see RequestInstance())
 def AttachToRoot(reg: dict<any>, root: string, ctxs: list<dict<any>>)
-  var instance = reg.instances->get(root, {})
+  if reg.instances->has_key(root)
+    for ctx in ctxs
+      AttachInstance(reg.instances[root], ctx)
+    endfor
+  elseif reg.pending->has_key(root)
+    var request = reg.pending[root]
+    for ctx in ctxs
+      if request.ctxs->util.Indexof((_, c) => c.bnr == ctx.bnr) == -1
+	request.ctxs->add(ctx)
+      endif
+    endfor
+  else
+    RequestInstance(reg, root, ctxs)
+  endif
+enddef
+
+# Create the server instance of the registration "reg" for the root "root",
+# with the settings computed by its "configForRoot" function, now or later.
+# Then attach the buffers of "ctxs" to it.  Until then, the root is in
+# "reg.pending", and the buffers with this root are added to "ctxs".
+def RequestInstance(reg: dict<any>, root: string, ctxs: list<dict<any>>)
+  var request = {ctxs: ctxs}
+  reg.pending[root] = request
+  var Done = function(OnConfig, [reg, root, request])
+  if !reg.params->has_key('configForRoot')
+    Done({})
+    return
+  endif
+
+  try
+    var ConfigForRoot = reg.params.configForRoot
+    ConfigForRoot(root, Done)
+  catch
+    util.ErrMsg($'configForRoot of LSP server "{reg.params.name}" failed: {v:exception}')
+    if reg.pending->get(root, {}) is request
+      reg.pending->remove(root)
+    endif
+  endtry
+enddef
+
+# The callback of the "configForRoot" function of the registration "reg" for
+# the root "root" and the "request" (see RequestInstance()).  A Dict
+# "config" overrides the settings of the registration.  v:null means "not
+# now": nothing is started, and the next buffer with this root asks again.
+def OnConfig(reg: dict<any>, root: string, request: dict<any>, config: any)
+  if reg.pending->get(root, {}) isnot request
+    # Called back twice, or after an error
+    return
+  endif
+  reg.pending->remove(root)
+
+  if config->type() == v:t_none
+    return
+  endif
+  if config->type() != v:t_dict
+    util.ErrMsg($'configForRoot of LSP server "{reg.params.name}" returned a value that is not a Dict: {config->string()}')
+    return
+  endif
+
+  var ctxs = request.ctxs->filter((_, ctx) => BufferWantsServer(ctx))
+  if ctxs->empty()
+    return
+  endif
+  var instance = NewInstance(reg, root, config)
   if instance->empty()
-    instance = NewInstance(reg, root)
+    return
   endif
   for ctx in ctxs
     AttachInstance(instance, ctx)
@@ -831,8 +972,28 @@ def AttachToRoot(reg: dict<any>, root: string, ctxs: list<dict<any>>)
 enddef
 
 # Create the server instance of the registration "reg" for the root "root"
-def NewInstance(reg: dict<any>, root: string): dict<any>
-  var instance = lserver.NewLspServer(reg.params)
+# (or SHARED_ROOT), with the settings of the registration overridden by
+# "config".  Returns an empty dict (after showing an error message) if the
+# settings are not valid.
+def NewInstance(reg: dict<any>, root: string, config: dict<any>): dict<any>
+  var params = reg.params
+  if !config->empty()
+    params = reg.params->deepcopy()
+    for [key, val] in config->items()
+      if REGISTRATION_KEYS->index(key) == -1
+	params[key] = val
+      endif
+    endfor
+  endif
+  if params.path->empty()
+    util.ErrMsg($'configForRoot of LSP server "{reg.params.name}" did not return a path for root "{root}"')
+    return {}
+  endif
+  if !config->empty() && !NormalizeServer(params)
+    return {}
+  endif
+
+  var instance = lserver.NewLspServer(params)
   instance.registrationId = reg.id
   if root != SHARED_ROOT
     instance.rootPath = root
@@ -950,6 +1111,10 @@ export def RemoveFile(bnr: number): void
   if bufAttachStates->has_key(bnr)
     bufAttachStates->remove(bnr)
   endif
+
+  if bufRootRequests->has_key(bnr)
+    bufRootRequests->remove(bnr)
+  endif
 enddef
 
 # The buffer "bnr" is wiped out
@@ -1030,6 +1195,16 @@ export def FastShutdownExitAllServers()
   endfor
 enddef
 
+# Forget the root requests of the buffers with 'filetype' set to "ftype" (see
+# bufRootRequests), so that their roots are asked again.
+def ForgetRootRequests(ftype: string)
+  for bnr in bufRootRequests->keys()
+    if bnr->str2nr()->getbufvar('&filetype') == ftype
+      bufRootRequests->remove(bnr)
+    endif
+  endfor
+enddef
+
 # Add all the buffers with 'filetype' set to "ftype" to the language server.
 def AddBuffersToLsp(ftype: string)
   # Add all the buffers with the same file type as the current buffer
@@ -1053,6 +1228,8 @@ def RestartServer()
   endif
 
   var roots = bufRoots->get(bnr, {})
+  # The buffers not attached to a server are asked again
+  ForgetRootRequests(ftype)
   var removedBufs: list<number> = []
   for reg in regs
     var root = roots->get(reg.id, null_string)
@@ -1074,6 +1251,14 @@ def RestartServer()
       ->filter((_, b) => b->bufloaded())
       ->mapnew((_, b) => ({bnr: b, ftype: b->getbufvar('&filetype'),
 			   sync: false, servers: []}))
+    # These buffers keep their root: they are not asked again below, even if
+    # "configForRoot" does not create the new instance
+    for ctx in ctxs
+      if !bufRootRequests->has_key(ctx.bnr)
+	bufRootRequests[ctx.bnr] = {}
+      endif
+      bufRootRequests[ctx.bnr][reg.id] = true
+    endfor
     AttachToRoot(reg, root, ctxs)
     # Keep the debug setting (see ":LspServer debug"), unless the new
     # instance is created later
@@ -1106,9 +1291,29 @@ enddef
 # values expected by NewLspServer(), in place.  Returns false (after showing an
 # error message) if the information is not valid.
 def NormalizeServer(server: dict<any>): bool
-  if !server->has_key('filetype') || !server->has_key('path')
+  # The "configForRoot" function can provide the path
+  if !server->has_key('filetype')
+      || (!server->has_key('path') && !server->has_key('configForRoot'))
     util.ErrMsg('LSP server information is missing filetype or path')
     return false
+  endif
+  for key in ['rootDir', 'configForRoot']
+    if server->has_key(key) && server[key]->type() != v:t_func
+      util.ErrMsg($'Setting of {key} {server[key]} is not a Funcref nor lambda')
+      return false
+    endif
+  endfor
+  if server->has_key('perRoot')
+    if server.perRoot->type() != v:t_bool
+      util.ErrMsg($'Setting of perRoot {server.perRoot} is not a Boolean')
+      return false
+    endif
+    # The "rootDir" and "configForRoot" functions work on a root
+    if !server.perRoot
+	&& (server->has_key('rootDir') || server->has_key('configForRoot'))
+      util.ErrMsg($'LSP server {server->get("name", server->get("path", ""))} with a rootDir or configForRoot function cannot have perRoot set to false')
+      return false
+    endif
   endif
   # Enable omni-completion by default when auto-complete is disabled, unless
   # the user explicitly overrides this per server.
@@ -1120,14 +1325,24 @@ def NormalizeServer(server: dict<any>): bool
   endif
   server.omnicompl = server->get('omnicompl', omnicompl_def)
 
-  server.path = expandcmd(server.path)
-
-  # Skip missing executables unless user opted into silent ignore.
-  if !server.path->executable()
-    if !opt.lspOptions.ignoreMissingServer
-      util.ErrMsg($'LSP server {server.path} is not found')
+  if !server->has_key('path')
+    # The name of the server instances cannot default to their path
+    if !server->has_key('name') || server.name->type() != v:t_string
+	|| server.name->empty()
+      util.ErrMsg('LSP server information is missing name or path')
+      return false
     endif
-    return false
+    server.path = ''
+  else
+    server.path = expandcmd(server.path)
+
+    # Skip missing executables unless user opted into silent ignore.
+    if !server.path->executable()
+      if !opt.lspOptions.ignoreMissingServer
+	util.ErrMsg($'LSP server {server.path} is not found')
+      endif
+      return false
+    endif
   endif
   if server->has_key('args')
     if server.args->type() != v:t_list
@@ -1253,7 +1468,7 @@ export def AddServer(serverList: list<dict<any>>)
     # AttachToRoot()), from a copy of the settings taken now
     registrationCount += 1
     var reg = {id: registrationCount, params: server->deepcopy(),
-	       instances: {}}
+	       instances: {}, pending: {}}
     for ftype in ftypes
       AddServerForFiltype(reg, ftype, server.omnicompl)
     endfor
