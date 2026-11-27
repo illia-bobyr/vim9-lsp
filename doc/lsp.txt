@@ -246,6 +246,8 @@ To add a language server, the following information is needed:
 	path		path to the language server executable (without any
 			arguments). The value is expanded with |expandcmd()|
 			and looked up in $PATH. A full path can also be used.
+			Can be omitted when |lsp-cfg-configForRoot| provides
+			it.  Then "name" is required.
 						*lsp-cfg-args*
 	args		a |List| of command-line arguments passed to the
 			language server.  Each space separated language server
@@ -302,6 +304,151 @@ To add a language server, the following information is needed:
 
 						*lsp-cfg-runUnlessSearch*
 	runUnlessSearch	(Optional) Opposite of |lsp-cfg-runIfSearch|.
+
+						*lsp-cfg-perRoot*
+	perRoot		(Optional) |Boolean|.  When true, start a separate
+			instance of the language server for each workspace
+			root directory.  The root directory of a buffer is
+			determined in the same way as the root sent to the
+			language server in the "initialize" request (see
+			|lsp-cfg-rootSearch|).  A buffer is attached to the
+			server instance for its root directory.  A buffer
+			whose root directory is ignored (see
+			|lsp-opt-workspaceIgnoredPaths|), e.g. a library file
+			in the Cargo registry or the Go module cache, is
+			attached to the running instance whose answer opened
+			it, else to the most recently used running instance
+			(see |lsp#lsp#ServerRoots()|), or to an instance
+			without a root if none is running.  See |:LspServer|
+			for the commands that act on the server instances of
+			the current root.  Each server instance is started
+			with its root directory as the current directory.
+			This can be used to derive per-root settings from the
+			current directory in the server command, e.g. the
+			workspace data directory of jdtls: >
+			  path: 'sh',
+			  args: ['-c', 'jdtls -data "$HOME/.jdtls/${PWD##*/}"']
+<			When false, a single instance of the language server
+			is used for all the buffers.  A language server with a
+			|lsp-cfg-rootDir| or a |lsp-cfg-configForRoot|
+			function always uses an instance per root: setting
+			"perRoot" to false for it is an error.  When not
+			specified, the |lsp-opt-serverPerRoot| option is used.
+
+						*lsp-cfg-rootDir*
+	rootDir		(Optional) a |Funcref| or |lambda| that computes the
+			workspace root directory of a buffer.  It is called
+			with the buffer number and a callback function
+			{OnRoot} when a buffer with one of the file types of
+			the language server is loaded (after the
+			|lsp-cfg-runIfSearch| and |lsp-cfg-runUnlessSearch|
+			checks).  To use the language server for the buffer,
+			call {OnRoot} with the root directory, either before
+			returning or later, e.g. from a job or a timer
+			callback.  An empty string means that the buffer has
+			no workspace root.  To not use the language server
+			for the buffer, don't call {OnRoot}.  If the buffer is
+			unloaded, or its file type changes, before {OnRoot} is
+			called, then the call is ignored.  A buffer that is
+			not used is checked again when its 'filetype' is set
+			again (e.g. when the file is reloaded with |:edit|),
+			or by ":LspServer restart" and ":LspServer start".
+
+			A language server with a "rootDir" or a
+			"configForRoot" function uses a separate instance for
+			each root directory, as with |lsp-cfg-perRoot|.
+			All the buffers with the same root are attached to
+			the same instance.  The "rootSearch" setting and the
+			|lsp-opt-workspaceIgnoredPaths| option are not used
+			to find the root.  The function can call
+			|lsp#lsp#DefaultRootDir()| to use them.  To attach a
+			library file (e.g. in the Cargo registry) to the
+			server instance of the project it was opened from,
+			use |lsp#lsp#ServerRoots()|.
+
+			Example: use the root of the Cargo workspace (and not
+			of the crate) as the root, and attach the files in the
+			Cargo registry to the server instance whose answer
+			opened them, else to the most recently used one: >
+
+		vim9script
+		def CargoRootDir(bnr: number, OnRoot: func)
+		  var fname = bnr->bufname()->fnamemodify(':p')
+		  if fname->stridx(expand('~/.cargo/registry/')) == 0
+		    var roots = lsp#lsp#ServerRoots('rust-analyzer', bnr)
+		    if !roots->empty()
+		      OnRoot(roots[-1])
+		    endif
+		    return
+		  endif
+		  var out: list<string> = []
+		  job_start(['cargo', 'metadata', '--no-deps',
+			     '--format-version', '1'], {
+		    cwd: fname->fnamemodify(':h'),
+		    out_cb: (_, msg) => out->add(msg),
+		    close_cb: (_) => {
+		      if !out->empty()
+			OnRoot(out->join()->json_decode().workspace_root)
+		      endif
+		    }})
+		enddef
+		g:LspAddServer([{
+			name: 'rust-analyzer',
+			filetype: ['rust'],
+			path: 'rust-analyzer',
+			args: [],
+			rootDir: CargoRootDir
+		}])
+<
+						*lsp-cfg-configForRoot*
+	configForRoot	(Optional) a |Funcref| or |lambda| that computes the
+			settings of the language server for a workspace root
+			directory.  It is called with the root directory and
+			a callback function {Done} before the instance of the
+			language server for this root is started, and again
+			by ":LspServer restart".  The root directory is
+			computed by |lsp-cfg-rootDir|, or as described in
+			|lsp-cfg-rootSearch|, and is a full path ending in a
+			path separator (see |::p|).  Call {Done} with a |Dict|
+			of settings, either before returning or later, e.g.
+			from a job or a timer callback.  Each item replaces the
+			registered setting with the same name, for this
+			server instance only, e.g. "path", "args",
+			"initializationOptions" or "workspaceConfig".  The
+			settings are checked and get default values in the
+			same way as the registered settings.  The "name",
+			"filetype", "omnicompl", "perRoot", "rootDir",
+			"configForRoot", "rootSearch", "runIfSearch" and
+			"runUnlessSearch"
+			settings cannot be replaced.
+
+			Call {Done} with |v:null| to not start the language
+			server for now, e.g. when it is not built yet.  This
+			is not remembered: the next buffer with this root
+			calls the function again.  The buffers with the same
+			root loaded before {Done} is called are attached to
+			the server instance when it starts.
+
+			Example: a language server built in the project: >
+
+		vim9script
+		def HlsConfig(root: string, Done: func)
+		  var hls = $'{root}/bin/haskell-language-server'
+		  if !hls->executable()
+		    echomsg $'Build the language server in {root}'
+		    Done(v:null)
+		    return
+		  endif
+		  Done({path: hls, args: ['--lsp'],
+			workspaceConfig: {haskell: {checkProject: false}}})
+		enddef
+		g:LspAddServer([{
+			name: 'hls',
+			filetype: ['haskell'],
+			rootSearch: ['cabal.project', 'stack.yaml'],
+			configForRoot: HlsConfig
+		}])
+<
 
 Additionally the following configurations can be made:
 
@@ -541,6 +688,45 @@ initializing.
 				    *LspServerRunning()* *g:LspServerRunning()*
 The g:LspServerRunning({filetype}) function returns |v:true| if one or more
 language servers registered for {filetype} are currently running.
+
+						*lsp#lsp#ServerRoots()*
+The lsp#lsp#ServerRoots({name} [, {bnr}]) function returns a |List| with the
+workspace root directories of the running instances of the language server
+named {name}, ordered by last use: the most recently used last.  A server
+instance is used when a buffer attached to it is entered (also by going to
+another window), and when the current buffer is attached to it.  Each root is
+a full path ending in a path separator, or an empty string for an instance
+without a workspace root.
+
+With the buffer number {bnr}, the root of the origin of the buffer is moved
+last, if it is a running instance of {name}.  The origin of a buffer is the
+server instance whose answer opened it: by going to a location (e.g. with
+|:LspGotoDefinition|, |:LspPeekDefinition|, |:LspSymbolSearch|, the call or
+type hierarchy, or 'tagfunc'), or from a quickfix or location list filled
+with locations (e.g. by |:LspShowReferences|) while that list is the current
+one.  It is known when the root of the buffer is resolved (also when a
+|lsp-cfg-rootDir| function calls back later), and kept until the buffer is
+wiped out.  A file opened otherwise (e.g. with |gf| or |:edit|) has no
+origin.  The origin from 'tagfunc' (which loads the files of its answer for
+this) and from a list is only recorded for a language server with an
+instance per root (|lsp-cfg-perRoot|).
+
+This can be used in a |lsp-cfg-rootDir| function to attach a library file,
+whose project is not known, to the server instance it was opened from: use
+the last root of lsp#lsp#ServerRoots({name}, {bnr}).  Without an origin, this
+is the instance the user was working with: while the "rootDir" function of a
+new buffer is called, the buffer is not entered yet, so the last root is the
+one of the buffer the file is opened from.  A buffer that is not attached to
+a server instance, like the quickfix window, does not change the order.
+
+						*lsp#lsp#DefaultRootDir()*
+The lsp#lsp#DefaultRootDir({bnr} [, {rootSearch}]) function returns the
+workspace root directory of the buffer {bnr}, computed in the same way as for
+a language server without a |lsp-cfg-rootDir| function, with the {rootSearch}
+|List| of file and directory names (see |lsp-cfg-rootSearch|).  Returns an
+empty string if the root is ignored (see |lsp-opt-workspaceIgnoredPaths|).
+This can be used in a |lsp-cfg-rootDir| function to fall back to the
+default root.
 
 ==============================================================================
 							*lsp-commands*
@@ -1501,7 +1687,13 @@ manage workspace folder scope.
 			    Restart (stop and then start) the language server
 			    for the current buffer. All the loaded buffers
 			    with the same filetype as the current buffer are
-			    added back to the server.
+			    added back to the server.  When there is a server
+			    instance per root (see |lsp-cfg-perRoot|),
+			    only the instances for the root of the current
+			    buffer are restarted.  A new server instance
+			    replaces the old one, with the settings computed
+			    again by the |lsp-cfg-configForRoot| function, if
+			    there is one.
 
 			show {capabilities | initializeRequest | messages
 								| status}
@@ -1531,18 +1723,29 @@ manage workspace folder scope.
 
 			start
 			    Command to start the language servers registered
-			    for the filetype of the current buffer.  All the
-			    buffers with this filetype are added to the
-			    server.
+			    for the filetype of the current buffer (only the
+			    server instances for the root of the current
+			    buffer, when there is a server instance per root,
+			    see |lsp-cfg-perRoot|).  All the buffers
+			    with this filetype are added to the server.
+			    The buffers that were attached to a stopped
+			    server instance (e.g. library files) are
+			    attached to it again.
 
 			stop
 			    Command to stop all the language servers
 			    registered for the filetype of the current buffer.
 			    Note that this stops the language servers for all
-			    the buffers with this filetype.  Opening a new
-			    file with this filetype will not start the
-			    language server till the server is explicitly
-			    started using the start command.
+			    the buffers with this filetype (or with the same
+			    root as the current buffer, when there is a
+			    server instance per root, see
+			    |lsp-cfg-perRoot|).  Opening a new file
+			    with this filetype will not start the language
+			    server till the server is explicitly started
+			    using the start command.  The buffers attached
+			    to a stopped server instance (e.g. library
+			    files) are not attached to another instance of
+			    the language server until then.
 
 			trace { off | messages | verbose }
 			    Set the language server debug trace value using
@@ -1559,7 +1762,12 @@ manage workspace folder scope.
 			The output has two sections:
 			- "Filetype Information" shows the registered Vim file
 			  types, matching language servers, executable paths,
-			  and whether each server is currently running.
+			  and whether each server is currently running.  When
+			  there is a server instance per root (see
+			  |lsp-cfg-perRoot|), each instance is shown
+			  with its root, and a root whose
+			  |lsp-cfg-configForRoot| function has not called
+			  back yet is shown as "Waiting for configForRoot".
 			- "Buffer Information" shows which language servers
 			  are attached to each buffer.
 
@@ -1959,6 +2167,19 @@ semanticHighlightDelay	|Number| option.  Delay in milliseconds for semantic
 			more requests to the language server.
 			By default this is set to 1000.
 
+						*lsp-opt-serverPerRoot*
+serverPerRoot		|Boolean| option.  The default value of the
+			|lsp-cfg-perRoot| setting of the language servers:
+			when set to true, start a separate instance of a
+			language server for each workspace root directory.
+			This is useful when working on multiple projects
+			(e.g. git worktrees) in the same Vim session.  A
+			language server uses the value of the option when its
+			first buffer is opened: changing the option later
+			does not change the language servers that were
+			already used.
+			By default this is set to false.
+
 						*lsp-opt-showDiagInBalloon*
 showDiagInBalloon	|Boolean| option.  When the mouse is over a range of
 			text referenced by a diagnostic, display the
@@ -2126,7 +2347,9 @@ workspaceIgnoredPaths	|List| option.  Directory paths that are never
 			used as the workspace root for any language server.
 			If the resolved workspace root matches an entry, a
 			null root is sent to the server so it only analyzes
-			the current buffer.  Glob patterns are supported.
+			the current buffer.  When there is a server instance
+			per root, see |lsp-cfg-perRoot| for the instance the
+			buffer is attached to.  Glob patterns are supported.
 
 			Default:
  			['/', $"{$HOME}", $"{$HOME}/.cargo", $"{$HOME}/.cargo/**",

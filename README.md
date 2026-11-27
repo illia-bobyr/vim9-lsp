@@ -98,13 +98,16 @@ To register a LSP server, the following information is needed:
 Field|Description
 -----|-----------
 `filetype`|One or more file types supported by the LSP server.  This can be a String or a List. To specify multiple multiple file types, use a List.
-`path`|complete path to the LSP server executable (without any arguments).
+`path`|complete path to the LSP server executable (without any arguments).  Can be omitted when `configForRoot` provides it.
 `args`|a list of command-line arguments passed to the LSP server. Each argument is a separate List item.
 `initializationOptions`|User provided initialization options. May be of any type. For example the *intelephense* PHP language server accept several options here with the License Key among others. 
 `clientCapabilities`|A dictionary of additional client capabilities sent to the LSP server. See `:help lsp-cfg-clientCapabilities`.
 `customNotificationHandlers`|A dictionary of notifications and functions that can be specified to add support for custom language server notifications.
 `customRequestHandlers`|A dictionary of request handlers and functions that can be specified to add support for custom language server requests replies.
 `features`|A dictionary of booleans that can be specified to toggle what things a given LSP is providing (folding, goto definition, etc) This is useful when running multiple servers in one buffer.
+`perRoot`|If true, a separate LSP server instance is used for each workspace root.  Defaults to the `serverPerRoot` option.  See `:help lsp-cfg-perRoot`.
+`rootDir`|A function that computes the workspace root of a buffer, or declines the buffer.  A separate LSP server instance is used for each root.  See `:help lsp-cfg-rootDir`.
+`configForRoot`|A function that computes the LSP server settings (path, arguments, initialization options, ...) for a workspace root.  See `:help lsp-cfg-configForRoot`.
 
 The `LspAddServer()` function accepts a list of LSP servers with the above information.
 
